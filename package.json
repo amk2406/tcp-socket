@@ -1,0 +1,25 @@
+{
+  "name": "tcp-socket-example",
+  "version": "1.0.0",
+  "description": "Fast Socket.IO-style TCP module for Node.js (LAN / Wi-Fi)",
+  "main": "tcp-socket.js",
+  "scripts": {
+    "server": "node examples/basic-server.js",
+    "client": "node examples/basic-client.js",
+    "sensor-server": "node examples/sensor-server.js",
+    "sensor-client": "node examples/sensor-client.js"
+  },
+  "keywords": [
+    "tcp",
+    "socket",
+    "msgpack",
+    "realtime",
+    "lan",
+    "iot"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@msgpack/msgpack": "^3.1.1"
+  }
+}
