@@ -1,5 +1,5 @@
 {
-  "name": "tcp-socket-example",
+  "name": "tcp-socket",
   "version": "1.0.0",
   "description": "Fast Socket.IO-style TCP module for Node.js (LAN / Wi-Fi)",
   "main": "tcp-socket.js",
@@ -17,7 +17,7 @@
     "lan",
     "iot"
   ],
-  "author": "",
+  "author": "Amk <abdulamk2406@gmail.com>",
   "license": "MIT",
   "dependencies": {
     "@msgpack/msgpack": "^3.1.1"
