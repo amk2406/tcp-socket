@@ -1,6 +1,0 @@
-Xender Lite 
--version 1.0.0 
--licence MIT
-by Amk abdulamk2406@gmail.com
-https://github.com/amk2406
-github pages
