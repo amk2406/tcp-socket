@@ -1,140 +1,130 @@
 /**
  * =============================================================================
- * TCPSocket + TCPServer
+ * TCPSocket + TCPServer  –  Robust Socket.IO-style TCP for Node.js
  * =============================================================================
  *
- * A production-oriented, Socket.IO-inspired TCP module built on Node.js 'net'.
- *
- * Why this exists
- * ---------------
- * Raw TCP has significantly lower overhead and latency than HTTP or even
- * WebSocket for high-frequency structured data, especially on a local network
- * (Wi-Fi / LAN). This module gives you a familiar event-based API while using
- * a simple, efficient binary framing protocol.
+ * Design goals of this version
+ * ----------------------------
+ * 1. The server must never crash because of one bad / malicious client.
+ * 2. Small protocol or size errors produce clear, non-fatal reactions.
+ * 3. Normal disconnects are cleanly separated from real errors.
+ * 4. Limits (maxMessageSize, maxBufferSize …) are respected on both sides
+ *    and can be negotiated / enforced consistently.
+ * 5. Memory safety is hard-enforced.
+ * 6. API stays familiar (emit / on / ack / reconnect).
  *
  * Protocol
  * --------
  * Every message is framed as:
  *   [ 4-byte little-endian unsigned length ][ MessagePack payload ]
  *
- * The payload is a plain object with at least a "type" field:
+ * Payload is a plain object with at least a "type" field:
  *   - type: 'event'      → application message (may request an ack)
  *   - type: 'ack'        → reply to a previous event that requested an ack
  *   - type: 'heartbeat'  → keep-alive / liveness check
- *   - type: 'error'      → optional error signalling
+ *   - type: 'error'      → structured protocol / application error
+ *   - type: 'config'     → server announces its limits to the client
  *
- * Important limitations
- * ---------------------
- * - Node.js ↔ Node.js only (browsers cannot open raw TCP sockets).
- * - Does NOT speak the Socket.IO or WebSocket protocol.
- * - Cannot be attached directly to an Express / http.Server.
- * - You can of course run this TCP server on one port and Express + Socket.IO
- *   on another port at the same time.
- *
- * Design highlights of this repaired version
- * ------------------------------------------
- * - Local lifecycle events (connect, disconnect, error, reconnect…) use the
- *   real EventEmitter (super.emit). They never go over the network.
- * - Application events use the overridden emit() → network.
- * - Incoming application events are delivered via super.emit so that normal
- *   .on() / .once() listeners work for both lifecycle and application events.
- * - Acks follow the classic Socket.IO pattern: the listener receives an
- *   optional ack callback as the last argument.
- * - Heartbeat timeout is correctly cleared on every pong.
- * - Receive buffer and send queue have hard size limits (memory safety).
- * - Automatic reconnection with exponential backoff (client side only).
+ * System / protocol messages use id: null (or omit id).
+ * Application ack correlation uses positive integers starting at 1.
  */
+
+'use strict';
 
 const net = require('net');
 const { encode, decode } = require('@msgpack/msgpack');
 const EventEmitter = require('events');
 
-/**
- * Client-side (and also the per-connection object used on the server).
- *
- * Extends EventEmitter so you can write the familiar:
- *   socket.on('connect', …)
- *   socket.on('myEvent', (data, ack) => { … })
- *   socket.on('disconnect', …)
- */
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+const DEFAULTS = {
+  port: 3000,
+  host: 'localhost',                 // client default
+  reconnect: true,
+  reconnectInterval: 2000,           // base delay (ms)
+  maxReconnectAttempts: 10,
+  heartbeatInterval: 30000,
+  heartbeatTimeout: 10000,
+  messageTimeout: 30000,             // ack timeout
+  maxQueueSize: 1000,
+  maxBufferSize: 5 * 1024 * 1024,    // 5 MB receive buffer
+  maxMessageSize: 2 * 1024 * 1024,   // 2 MB single message
+  debug: false,
+  // When true the client will adopt the limits announced by the server
+  adoptServerLimits: true
+};
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function safeCall(fn, ...args) {
+  try {
+    return fn(...args);
+  } catch (err) {
+    // Never let user callbacks or internal handlers crash the process
+    return undefined;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// TCPSocket  (client + per-connection object on the server)
+// ---------------------------------------------------------------------------
+
 class TCPSocket extends EventEmitter {
   /**
    * @param {Object} [options]
-   * @param {number}  [options.port=3000]
-   * @param {string}  [options.host='localhost']
-   * @param {boolean} [options.reconnect=true]           – auto-reconnect on drop
-   * @param {number}  [options.reconnectInterval=2000]   – base delay in ms
-   * @param {number}  [options.maxReconnectAttempts=10]
-   * @param {number}  [options.heartbeatInterval=30000]  – how often we ping
-   * @param {number}  [options.heartbeatTimeout=10000]   – how long we wait for pong
-   * @param {number}  [options.messageTimeout=30000]     – ack timeout
-   * @param {number}  [options.maxQueueSize=1000]        – pending messages while offline
-   * @param {number}  [options.maxBufferSize=5MB]        – incoming TCP data buffer
-   * @param {number}  [options.maxMessageSize=2MB]       – single MessagePack message
-   * @param {boolean} [options.debug=false]
    */
   constructor(options = {}) {
     super();
 
-    this.options = {
-      port: 3000,
-      host: 'localhost',
-      reconnect: true,
-      reconnectInterval: 2000,
-      maxReconnectAttempts: 10,
-      heartbeatInterval: 30000,
-      heartbeatTimeout: 10000,
-      messageTimeout: 30000,
-      maxQueueSize: 1000,
-      maxBufferSize: 5 * 1024 * 1024,   // 5 MB – protect against slowloris-style attacks
-      maxMessageSize: 2 * 1024 * 1024,  // 2 MB – single message hard limit
-      debug: false,
-      ...options
-    };
+    this.options = { ...DEFAULTS, ...options };
 
-    // ---- connection state ----
-    this.socket = null;           // the raw net.Socket
-    this.connected = false;       // TCP handshake completed
-    this.connecting = false;      // connect() currently in progress
-    this.ready = false;           // higher-level “can send application data”
-    this.closed = false;          // user called disconnect() – do not reconnect
-    this.id = null;               // assigned by TCPServer (server-side only)
+    // Connection state
+    this.socket = null;
+    this.connected = false;
+    this.connecting = false;
+    this.ready = false;
+    this.closed = false;          // user explicitly called disconnect()
+    this.id = null;               // assigned by TCPServer (server-side)
 
-    // ---- timers ----
+    // Timers
     this.reconnectTimer = null;
-    this.heartbeatTimer = null;         // setInterval that sends pings
-    this.heartbeatTimeoutTimer = null;  // setTimeout that fires if pong never arrives
+    this.heartbeatTimer = null;
+    this.heartbeatTimeoutTimer = null;
 
-    // ---- framing & reliability ----
-    this.buffer = Buffer.alloc(0);      // accumulates TCP chunks until a full message arrives
-    this.messageQueue = [];             // messages waiting for the socket to become writable
-    this.ackCallbacks = new Map();      // id → { callback, timer }
-    this.ackId = 0;                     // monotonic counter for ack correlation
+    // Framing & reliability
+    this.buffer = Buffer.alloc(0);
+    this.messageQueue = [];
+    this.ackCallbacks = new Map(); // id → { callback, timer }
+    this.ackId = 0;                // next ack id (starts at 1 when used)
     this.reconnectAttempts = 0;
+
+    // Effective limits (may be updated by server 'config' message)
+    this.effectiveMaxMessageSize = this.options.maxMessageSize;
+    this.effectiveMaxBufferSize  = this.options.maxBufferSize;
   }
 
-  // ===========================================================================
+  // =========================================================================
   // PUBLIC API
-  // ===========================================================================
+  // =========================================================================
 
   /**
    * Open a TCP connection.
-   * Resolves when the TCP handshake succeeds (local 'connect' event is also emitted).
-   * Rejects on immediate failure or after a 10 s timeout.
-   *
-   * @param {string} [host] – overrides constructor option
-   * @param {number} [port] – overrides constructor option
+   * @param {string} [host]
+   * @param {number} [port]
    * @returns {Promise<void>}
    */
   connect(host, port) {
-    // Already connected or a connection attempt is in flight → no-op
     if (this.connected || this.connecting) {
       return Promise.resolve();
     }
 
     return new Promise((resolve, reject) => {
       this.connecting = true;
-      this.closed = false;   // allow future reconnects again
+      this.closed = false;
 
       const connectHost = host || this.options.host;
       const connectPort = port || this.options.port;
@@ -143,38 +133,47 @@ class TCPSocket extends EventEmitter {
 
       this.socket = net.createConnection({ host: connectHost, port: connectPort });
 
-      // ---- one-shot helpers so we can clean up listeners ----
-      const onConnect = () => {
+      let settled = false;
+
+      const finish = (err) => {
+        if (settled) return;
+        settled = true;
         cleanup();
-        this.connected = true;
         this.connecting = false;
+        if (err) reject(err);
+        else resolve();
+      };
+
+      const onConnect = () => {
+        this.connected = true;
         this.reconnectAttempts = 0;
         this.ready = true;
-
         this.log('Connected');
         this.startHeartbeat();
-        this.flushQueue();          // send anything that was queued while offline
-        super.emit('connect');      // ← LOCAL event (not sent over the network)
-        resolve();
+        this.flushQueue();
+        super.emit('connect');
+        finish(null);
       };
 
       const onError = (err) => {
-        this.log('Connect error:', err.message);
-        // Only reject the promise if we are still in the connecting phase
-        if (this.connecting) {
-          cleanup();
-          this.connecting = false;
-          reject(err);
+        this.log('Connect/socket error:', err.message);
+        // Only reject the connect() promise while still connecting
+        if (this.connecting && !settled) {
+          finish(err);
         }
-        super.emit('error', err);   // always surface the error locally
+        // Surface real errors, but do not treat every close as fatal
+        if (!this._isBenignCloseError(err)) {
+          super.emit('error', err);
+        }
       };
 
-      const onClose = () => {
+      const onClose = (hadError) => {
         cleanup();
-        this.handleDisconnect();
+        this.handleDisconnect(hadError);
       };
 
       const cleanup = () => {
+        if (!this.socket) return;
         this.socket.off('connect', onConnect);
         this.socket.off('error', onError);
         this.socket.off('close', onClose);
@@ -184,50 +183,45 @@ class TCPSocket extends EventEmitter {
       this.socket.once('connect', onConnect);
       this.socket.on('error', onError);
       this.socket.on('close', onClose);
-      this.socket.on('data', (chunk) => this.handleData(chunk));
+      this.socket.on('data', (chunk) => {
+        try {
+          this.handleData(chunk);
+        } catch (err) {
+          this.log('Unhandled error in handleData:', err.message);
+          super.emit('error', err);
+          this._forceClose();
+        }
+      });
 
-      // Hard timeout so connect() cannot hang forever
       const timeout = setTimeout(() => {
-        if (this.connecting) {
+        if (this.connecting && !settled) {
           this.socket.destroy();
-          cleanup();
-          this.connecting = false;
-          reject(new Error('Connection timeout'));
+          finish(new Error('Connection timeout'));
         }
       }, 10000);
     });
   }
 
   /**
-   * Send an application event (the Socket.IO-style method).
-   *
-   * Forms:
-   *   emit(event, data)
-   *   emit(event, data, callback)     // callback receives (err, response)
-   *   emit(event, callback)           // data = null
-   *
-   * When a callback (or the returned Promise) is used, the peer is asked to
-   * acknowledge the message. The ack is correlated by a numeric id.
-   *
+   * Send an application event (Socket.IO style).
    * @param {string} event
    * @param {*} [data]
    * @param {function} [callback]
-   * @returns {Promise<*>} resolves with the ack payload (or undefined)
+   * @returns {Promise<*>}
    */
   emit(event, data, callback) {
     if (typeof event !== 'string') {
-      throw new Error('Event name must be a string');
+      return Promise.reject(new Error('Event name must be a string'));
     }
 
-    // Support the convenient form emit('event', callback)
     if (typeof data === 'function') {
       callback = data;
       data = null;
     }
 
     return new Promise((resolve, reject) => {
-      const id = this.ackId++;
       const wantsAck = typeof callback === 'function';
+      const id = wantsAck ? (++this.ackId) : null;
 
       const message = {
         type: 'event',
@@ -238,70 +232,65 @@ class TCPSocket extends EventEmitter {
       };
 
       if (wantsAck) {
-        // Guard against a peer that never answers
         const timer = setTimeout(() => {
           this.ackCallbacks.delete(id);
           const err = new Error(`Ack timeout for event: ${event}`);
-          if (callback) callback(err);
+          safeCall(callback, err);
           reject(err);
         }, this.options.messageTimeout);
 
         this.ackCallbacks.set(id, {
           callback: (result) => {
             clearTimeout(timer);
-            if (callback) callback(null, result);
+            safeCall(callback, null, result);
             resolve(result);
           },
           timer
         });
       }
 
-      this.send(message);
-
-      // Fire-and-forget → resolve immediately
-      if (!wantsAck) {
-        resolve();
+      const ok = this.send(message);
+      if (!ok && wantsAck) {
+        // Could not even queue / send → fail the ack immediately
+        this.ackCallbacks.delete(id);
+        clearTimeout(this.ackCallbacks.get(id)?.timer);
+        const err = new Error('Failed to send message (not connected or queue full)');
+        safeCall(callback, err);
+        reject(err);
+        return;
       }
+
+      if (!wantsAck) resolve();
     });
   }
 
   /**
-   * Graceful shutdown.
-   * - Stops heartbeats and reconnection attempts
-   * - Destroys the underlying socket
-   * - Clears queues and pending acks
-   * - Emits a local 'disconnect' event
+   * Graceful shutdown. Stops reconnection.
    */
   disconnect() {
-    this.closed = true;         // prevent automatic reconnect
+    this.closed = true;
     this.ready = false;
     this.connected = false;
     this.connecting = false;
 
     this.stopHeartbeat();
     this.clearReconnectTimer();
-
-    if (this.socket && !this.socket.destroyed) {
-      this.socket.destroy();
-    }
-    this.socket = null;
-
-    this.buffer = Buffer.alloc(0);
-    this.messageQueue = [];
     this.clearAllAcks();
 
-    super.emit('disconnect');   // LOCAL event
+    if (this.socket && !this.socket.destroyed) {
+      try { this.socket.destroy(); } catch (_) {}
+    }
+    this.socket = null;
+    this.buffer = Buffer.alloc(0);
+    this.messageQueue = [];
+
+    super.emit('disconnect');
   }
 
-  /** @returns {boolean} */
   isConnected() {
     return this.connected && this.socket && !this.socket.destroyed;
   }
 
-  /**
-   * Lightweight runtime diagnostics – useful for monitoring or debugging.
-   * @returns {Object}
-   */
   getStats() {
     return {
       connected: this.connected,
@@ -311,101 +300,117 @@ class TCPSocket extends EventEmitter {
       queueLength: this.messageQueue.length,
       ackCount: this.ackCallbacks.size,
       bufferSize: this.buffer.length,
-      id: this.id
+      id: this.id,
+      effectiveMaxMessageSize: this.effectiveMaxMessageSize,
+      effectiveMaxBufferSize: this.effectiveMaxBufferSize
     };
   }
 
-  // ===========================================================================
-  // INTERNAL – framing, reliability, heartbeat, reconnection
-  // ===========================================================================
+  // =========================================================================
+  // INTERNAL – send / receive / framing
+  // =========================================================================
 
   /**
-   * Low-level send. If the socket is not writable the message is queued
-   * (up to maxQueueSize). Large messages are rejected.
+   * Low-level send. Returns true if the message was written or queued.
    * @private
    */
   send(message) {
     if (!this.connected || !this.socket || this.socket.destroyed) {
       if (this.messageQueue.length >= this.options.maxQueueSize) {
         this.log('Queue full – dropping message');
-        return;
+        return false;
       }
       this.messageQueue.push(message);
-      return;
+      return true;
     }
 
     try {
       const encoded = encode(message);
 
-      if (encoded.length > this.options.maxMessageSize) {
-        throw new Error(`Message too large: ${encoded.length} bytes`);
+      if (encoded.length > this.effectiveMaxMessageSize) {
+        const err = new Error(
+          `Message too large: ${encoded.length} bytes (limit ${this.effectiveMaxMessageSize})`
+        );
+        this.log(err.message);
+        super.emit('error', err);
+        return false;
       }
 
-      // 4-byte little-endian length prefix
       const header = Buffer.alloc(4);
       header.writeUInt32LE(encoded.length, 0);
-
       this.socket.write(Buffer.concat([header, encoded]));
       this.log('Sent:', message.event || message.type);
+      return true;
     } catch (err) {
       this.log('Send error:', err.message);
       super.emit('error', err);
-
-      // Best-effort re-queue (may still be dropped later if queue is full)
-      if (this.messageQueue.length < this.options.maxQueueSize) {
-        this.messageQueue.push(message);
-      }
+      return false;
     }
   }
 
   /**
-   * TCP 'data' handler. Accumulates chunks and extracts complete frames.
-   * Protects against oversized buffers and malformed length prefixes.
+   * TCP data handler – accumulates and extracts frames.
+   * Heavily defended so malformed input cannot crash the process.
    * @private
    */
   handleData(chunk) {
+    if (!Buffer.isBuffer(chunk) || chunk.length === 0) return;
+
     this.buffer = Buffer.concat([this.buffer, chunk]);
 
-    // Memory-safety: if the peer is sending garbage we stop accepting data
-    if (this.buffer.length > this.options.maxBufferSize) {
-      this.log('Receive buffer limit exceeded – closing connection');
-      this.disconnect();
+    // Hard memory limit
+    if (this.buffer.length > this.effectiveMaxBufferSize) {
+      this.log('Receive buffer limit exceeded – closing');
+      this._sendProtocolError('BUFFER_LIMIT', 'Receive buffer limit exceeded');
+      this._forceClose();
       return;
     }
 
-    // Extract as many complete messages as possible
     while (this.buffer.length >= 4) {
       const msgLen = this.buffer.readUInt32LE(0);
 
-      // Sanity checks on the declared length
-      if (msgLen <= 0 || msgLen > this.options.maxMessageSize) {
-        this.log('Invalid message length:', msgLen);
-        this.disconnect();
+      // Invalid or oversized length → reject cleanly
+      if (msgLen <= 0 || msgLen > this.effectiveMaxMessageSize) {
+        this.log('Invalid / oversized message length:', msgLen);
+        this._sendProtocolError(
+          'MESSAGE_TOO_LARGE',
+          `Message length ${msgLen} exceeds limit ${this.effectiveMaxMessageSize}`
+        );
+        this._forceClose();
         return;
       }
 
-      // Wait for the full payload
-      if (this.buffer.length < 4 + msgLen) break;
+      if (this.buffer.length < 4 + msgLen) break; // wait for full frame
 
       const data = this.buffer.subarray(4, 4 + msgLen);
       this.buffer = this.buffer.subarray(4 + msgLen);
 
+      let message;
       try {
-        const message = decode(data);
+        message = decode(data);
+      } catch (err) {
+        this.log('MessagePack decode error:', err.message);
+        this._sendProtocolError('DECODE_ERROR', err.message);
+        // Do not close on a single bad message – just skip it
+        continue;
+      }
+
+      try {
         this.handleMessage(message);
       } catch (err) {
-        this.log('MessagePack parse error:', err.message);
+        this.log('Error while handling message:', err.message);
         super.emit('error', err);
+        // Continue processing subsequent messages
       }
     }
   }
 
   /**
-   * Dispatch a decoded message according to its "type" field.
+   * Dispatch decoded message.
    * @private
    */
   handleMessage(message) {
-    if (!message || !message.type) return;
+    if (!message || typeof message !== 'object' || !message.type) return;
 
     switch (message.type) {
       case 'event':
@@ -418,7 +423,11 @@ class TCPSocket extends EventEmitter {
         this.handleHeartbeat(message);
         break;
       case 'error':
-        super.emit('error', new Error(String(message.data)));
+        // Structured protocol / application error from peer
+        this.handlePeerError(message);
+        break;
+      case 'config':
+        this.handleConfig(message);
         break;
       default:
         this.log('Unknown message type:', message.type);
@@ -426,74 +435,100 @@ class TCPSocket extends EventEmitter {
   }
 
   /**
-   * Deliver an application event to local listeners.
-   * If the sender requested an ack we pass a callback as the last argument
-   * (Socket.IO style):
-   *
-   *   socket.on('sensor', (data, ack) => {
-   *     // … do work …
-   *     if (ack) ack({ ok: true });
-   *   });
-   *
+   * Deliver application event to local listeners.
    * @private
    */
   handleEvent(message) {
     const { event, data, id, ack } = message;
+    if (typeof event !== 'string') return;
 
     if (ack) {
       const ackFn = (response) => {
         this.send({ type: 'ack', id, data: response });
       };
-      super.emit(event, data, ackFn);
+      // Protect against exceptions in user listeners
+      safeCall(() => super.emit(event, data, ackFn));
     } else {
-      super.emit(event, data);
+      safeCall(() => super.emit(event, data));
     }
   }
 
   /**
-   * Correlate an incoming ack with the Promise / callback that is waiting for it.
+   * Correlate incoming ack.
    * @private
    */
   handleAck(message) {
+    if (message.id == null) return;
     const entry = this.ackCallbacks.get(message.id);
-    if (entry) {
-      this.ackCallbacks.delete(message.id);
-      clearTimeout(entry.timer);
-      entry.callback(message.data);
-    }
+    if (!entry) return;
+
+    this.ackCallbacks.delete(message.id);
+    clearTimeout(entry.timer);
+    safeCall(entry.callback, message.data);
   }
 
   /**
-   * Heartbeat / keep-alive logic.
-   * - If we receive a ping we immediately reply with a pong.
-   * - If we receive a pong we clear the “waiting for pong” timer.
+   * Heartbeat handling.
    * @private
    */
   handleHeartbeat(message) {
-    // Peer is checking that we are alive → answer
     if (message.data && message.data.ping) {
-      this.send({
-        type: 'heartbeat',
-        data: { pong: Date.now() }
-      });
+      this.send({ type: 'heartbeat', data: { pong: Date.now() } });
     }
-
-    // We got the pong we were waiting for → cancel the timeout
     if (message.data && message.data.pong) {
       if (this.heartbeatTimeoutTimer) {
         clearTimeout(this.heartbeatTimeoutTimer);
         this.heartbeatTimeoutTimer = null;
       }
-      super.emit('heartbeat');   // optional local notification
+      super.emit('heartbeat');
     }
   }
 
   /**
-   * Called whenever the underlying TCP socket closes (for any reason).
-   * Emits 'disconnect' and schedules a reconnect if appropriate.
+   * Peer sent a structured error.
    * @private
    */
-  handleDisconnect() {
+  handlePeerError(message) {
+    const code = message.code || 'PEER_ERROR';
+    const text = message.data || message.message || 'Peer reported an error';
+    const err = new Error(`[${code}] ${text}`);
+    err.code = code;
+    super.emit('error', err);
+
+    // Some errors are fatal for the connection
+    if (code === 'MESSAGE_TOO_LARGE' || code === 'BUFFER_LIMIT' || code === 'PROTOCOL') {
+      this._forceClose();
+    }
+  }
+
+  /**
+   * Server announced its limits – optionally adopt them.
+   * @private
+   */
+  handleConfig(message) {
+    if (!this.options.adoptServerLimits || !message.data) return;
+
+    const { maxMessageSize, maxBufferSize } = message.data;
+    if (typeof maxMessageSize === 'number' && maxMessageSize > 0) {
+      this.effectiveMaxMessageSize = Math.min(this.options.maxMessageSize, maxMessageSize);
+      this.log('Adopted maxMessageSize:', this.effectiveMaxMessageSize);
+    }
+    if (typeof maxBufferSize === 'number' && maxBufferSize > 0) {
+      this.effectiveMaxBufferSize = Math.min(this.options.maxBufferSize, maxBufferSize);
+      this.log('Adopted maxBufferSize:', this.effectiveMaxBufferSize);
+    }
+    super.emit('config', message.data);
+  }
+
+  // =========================================================================
+  // Disconnect / reconnect / heartbeat
+  // =========================================================================
+
+  /**
+   * Called on TCP close.
+   * @private
+   */
+  handleDisconnect(hadError = false) {
     const wasConnected = this.connected;
     this.connected = false;
     this.ready = false;
@@ -503,40 +538,58 @@ class TCPSocket extends EventEmitter {
     this.clearAllAcks();
 
     if (wasConnected) {
-      super.emit('disconnect');
+      super.emit('disconnect', { hadError: !!hadError });
     }
 
-    // Only auto-reconnect when the user has not explicitly called disconnect()
     if (this.options.reconnect && !this.closed) {
       this.scheduleReconnect();
     }
   }
 
   /**
-   * Start the periodic ping + pong-timeout machinery.
+   * Force-close the underlying socket without marking as user-requested.
    * @private
    */
+  _forceClose() {
+    this.ready = false;
+    this.connected = false;
+    if (this.socket && !this.socket.destroyed) {
+      try { this.socket.destroy(); } catch (_) {}
+    }
+  }
+
+  /**
+   * Send a structured protocol error to the peer (best-effort).
+   * @private
+   */
+  _sendProtocolError(code, text) {
+    try {
+      this.send({
+        type: 'error',
+        code,
+        data: text,
+        id: null
+      });
+    } catch (_) {}
+  }
+
   startHeartbeat() {
-    this.stopHeartbeat();   // idempotent
+    this.stopHeartbeat();
 
     this.heartbeatTimer = setInterval(() => {
-      if (!this.connected) return;
+      if (!this.isConnected()) return;
 
-      // Send ping
-      this.send({
-        type: 'heartbeat',
-        data: { ping: Date.now() }
-      });
+      this.send({ type: 'heartbeat', data: { ping: Date.now() } });
 
-      // If no pong arrives in time we consider the connection dead
+      // Arm timeout – if no pong arrives we consider the link dead
+      if (this.heartbeatTimeoutTimer) clearTimeout(this.heartbeatTimeoutTimer);
       this.heartbeatTimeoutTimer = setTimeout(() => {
-        this.log('Heartbeat timeout – forcing reconnect');
-        if (this.socket) this.socket.destroy();   // will trigger 'close' → handleDisconnect
+        this.log('Heartbeat timeout – closing');
+        this._forceClose();
       }, this.options.heartbeatTimeout);
     }, this.options.heartbeatInterval);
   }
 
-  /** @private */
   stopHeartbeat() {
     if (this.heartbeatTimer) {
       clearInterval(this.heartbeatTimer);
@@ -548,37 +601,29 @@ class TCPSocket extends EventEmitter {
     }
   }
 
-  /**
-   * Exponential back-off reconnection (capped at 30 s).
-   * @private
-   */
   scheduleReconnect() {
-    if (this.reconnectTimer || this.closed) return;
+    this.clearReconnectTimer();
 
-    this.reconnectAttempts++;
-
-    if (this.reconnectAttempts > this.options.maxReconnectAttempts) {
+    if (this.reconnectAttempts >= this.options.maxReconnectAttempts) {
       this.log('Max reconnect attempts reached');
       super.emit('reconnect_failed');
       return;
     }
 
-    const delay = Math.min(
-      this.options.reconnectInterval * Math.pow(1.5, this.reconnectAttempts - 1),
-      30000
-    );
+    const delay = this.options.reconnectInterval * Math.pow(1.5, this.reconnectAttempts);
+    this.reconnectAttempts++;
 
     this.log(`Reconnecting in ${Math.round(delay)} ms (attempt ${this.reconnectAttempts})`);
 
     this.reconnectTimer = setTimeout(() => {
-      this.reconnectTimer = null;
-      this.connect()
-        .then(() => super.emit('reconnect', this.reconnectAttempts))
-        .catch(() => this.scheduleReconnect());
+      this.connect().then(() => {
+        super.emit('reconnect', this.reconnectAttempts);
+      }).catch(() => {
+        // connect() already scheduled the next attempt via handleDisconnect
+      });
     }, delay);
   }
 
-  /** @private */
   clearReconnectTimer() {
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
@@ -586,7 +631,13 @@ class TCPSocket extends EventEmitter {
     }
   }
 
-  /** @private */
+  flushQueue() {
+    while (this.messageQueue.length > 0 && this.isConnected()) {
+      const msg = this.messageQueue.shift();
+      this.send(msg);
+    }
+  }
+
   clearAllAcks() {
     for (const [, entry] of this.ackCallbacks) {
       clearTimeout(entry.timer);
@@ -595,56 +646,47 @@ class TCPSocket extends EventEmitter {
   }
 
   /**
-   * Send every message that was queued while the socket was down.
+   * Errors that commonly appear on normal TCP close.
    * @private
    */
-  flushQueue() {
-    while (this.messageQueue.length > 0 && this.connected) {
-      const msg = this.messageQueue.shift();
-      this.send(msg);
-    }
+  _isBenignCloseError(err) {
+    if (!err) return true;
+    const code = err.code || '';
+    return (
+      code === 'ECONNRESET' ||
+      code === 'EPIPE' ||
+      code === 'ECONNABORTED' ||
+      code === 'ERR_STREAM_DESTROYED'
+    );
   }
 
-  /** @private */
   log(...args) {
     if (this.options.debug) {
-      console.log('[TCPSocket]', ...args);
+      console.log(`[TCPSocket${this.id != null ? ' #' + this.id : ''}]`, ...args);
     }
   }
 }
 
-// =============================================================================
-// SERVER
-// =============================================================================
+// ---------------------------------------------------------------------------
+// TCPServer
+// ---------------------------------------------------------------------------
 
-/**
- * Simple multi-client TCP server.
- * Each accepted connection becomes a fully-featured TCPSocket instance
- * (with reconnect disabled).
- */
 class TCPServer extends EventEmitter {
   /**
-   * @param {Object} [options] – same options as TCPSocket plus:
-   * @param {string} [options.host='0.0.0.0']
+   * @param {Object} [options]
    */
   constructor(options = {}) {
     super();
 
     this.options = {
-      port: 3000,
+      ...DEFAULTS,
       host: '0.0.0.0',
-      heartbeatInterval: 30000,
-      heartbeatTimeout: 10000,
-      maxQueueSize: 1000,
-      maxBufferSize: 5 * 1024 * 1024,
-      maxMessageSize: 2 * 1024 * 1024,
-      debug: false,
       ...options
     };
 
     this.server = null;
-    this.clients = new Map();   // id → TCPSocket
-    this.clientId = 0;
+    this.clients = new Map(); // id → TCPSocket
+    this.nextClientId = 1;
   }
 
   /**
@@ -655,13 +697,21 @@ class TCPServer extends EventEmitter {
    */
   listen(port, host) {
     return new Promise((resolve, reject) => {
-      this.server = net.createServer((socket) => this.handleConnection(socket));
+      this.server = net.createServer((socket) => {
+        // Isolate every connection – never let one client take the server down
+        try {
+          this.handleConnection(socket);
+        } catch (err) {
+          this.log('Error while accepting connection:', err.message);
+          try { socket.destroy(); } catch (_) {}
+        }
+      });
 
       const listenPort = port || this.options.port;
       const listenHost = host || this.options.host;
 
       this.server.listen(listenPort, listenHost, () => {
-        this.log(`Server listening on ${listenHost}:${listenPort}`);
+        this.log(`Listening on ${listenHost}:${listenPort}`);
         super.emit('listening');
         resolve();
       });
@@ -675,75 +725,97 @@ class TCPServer extends EventEmitter {
   }
 
   /**
-   * Turn a raw net.Socket into a managed TCPSocket and wire all events.
+   * Turn a raw net.Socket into a managed TCPSocket.
+   * Everything is wrapped so a single bad client cannot affect others.
    * @private
    */
-  handleConnection(socket) {
-    const clientId = ++this.clientId;
+  handleConnection(rawSocket) {
+    const clientId = this.nextClientId++;
 
-    // Create a client instance that will never try to reconnect
     const client = new TCPSocket({
       ...this.options,
-      reconnect: false,
+      reconnect: false,          // server-side sockets never reconnect
       debug: this.options.debug
     });
 
-    // The TCP connection is already established, so we inject the socket
-    client.socket = socket;
+    // Inject the already-connected socket
+    client.socket = rawSocket;
     client.connected = true;
     client.ready = true;
     client.id = clientId;
     client.closed = false;
+    client.effectiveMaxMessageSize = this.options.maxMessageSize;
+    client.effectiveMaxBufferSize  = this.options.maxBufferSize;
 
-    // Forward raw socket events into the TCPSocket machinery
-    socket.on('data', (chunk) => client.handleData(chunk));
-
-    socket.on('error', (err) => {
-      client.log('Socket error:', err.message);
-      // Let the server-level listeners know as well
-      super.emit('error', err);
-      client.handleDisconnect();
+    // ---- raw socket event wiring (defensive) ----
+    rawSocket.on('data', (chunk) => {
+      try {
+        client.handleData(chunk);
+      } catch (err) {
+        client.log('Unhandled data error:', err.message);
+        safeCall(() => super.emit('error', err));
+        try { rawSocket.destroy(); } catch (_) {}
+      }
     });
 
-    socket.on('close', () => {
+    rawSocket.on('error', (err) => {
+      client.log('Socket error:', err.message);
+      // Only surface non-benign errors
+      if (!client._isBenignCloseError(err)) {
+        safeCall(() => super.emit('error', err));
+      }
+      // Always clean up
+      client.handleDisconnect(true);
+    });
+
+    rawSocket.on('close', (hadError) => {
       client.connected = false;
       client.ready = false;
       this.clients.delete(clientId);
       client.stopHeartbeat();
       client.clearAllAcks();
-      super.emit('client_disconnect', client);
+      safeCall(() => super.emit('client_disconnect', client));
+      safeCall(() => super.emit('disconnect', client)); // alias
     });
 
-    // Server-side sockets also participate in the heartbeat protocol
+    // Start heartbeat on the server side as well
     client.startHeartbeat();
 
     this.clients.set(clientId, client);
 
-    // Notify application code
-    super.emit('connection', client);
-    super.emit('client_connect', client);
+    // Announce limits to the client so both sides stay in sync
+    client.send({
+      type: 'config',
+      data: {
+        maxMessageSize: this.options.maxMessageSize,
+        maxBufferSize: this.options.maxBufferSize,
+        clientId
+      },
+      id: null
+    });
 
-    this.log('Client connected:', clientId);
-
-    // Optional convenience: tell the client what id it was assigned
+    // Friendly welcome (application-level)
     client.send({
       type: 'event',
       event: 'connected',
       data: { clientId },
       ack: false,
-      id: 0
+      id: null
     });
+
+    this.log('Client connected:', clientId);
+    safeCall(() => super.emit('connection', client));
+    safeCall(() => super.emit('client_connect', client));
   }
 
   /**
-   * Send an event to every currently connected client.
-   * Errors on individual clients are swallowed so one bad client
-   * does not break the broadcast.
+   * Broadcast an event to every currently connected client.
+   * Failures on individual clients are swallowed.
    */
   broadcast(event, data) {
     for (const client of this.clients.values()) {
       if (client.connected) {
-        client.emit(event, data).catch(() => { /* ignore */ });
+        client.emit(event, data).catch(() => {});
       }
     }
   }
@@ -754,7 +826,7 @@ class TCPServer extends EventEmitter {
   }
 
   /**
-   * Stop accepting new connections and disconnect everyone.
+   * Stop the server and disconnect every client.
    * @returns {Promise<void>}
    */
   close() {
@@ -762,7 +834,7 @@ class TCPServer extends EventEmitter {
       if (!this.server) return resolve();
 
       for (const client of this.clients.values()) {
-        client.disconnect();
+        try { client.disconnect(); } catch (_) {}
       }
       this.clients.clear();
 
@@ -774,7 +846,6 @@ class TCPServer extends EventEmitter {
     });
   }
 
-  /** @private */
   log(...args) {
     if (this.options.debug) {
       console.log('[TCPServer]', ...args);
@@ -782,9 +853,9 @@ class TCPServer extends EventEmitter {
   }
 }
 
-// =============================================================================
-// PUBLIC EXPORTS
-// =============================================================================
+// ---------------------------------------------------------------------------
+// Public exports
+// ---------------------------------------------------------------------------
 
 module.exports = {
   TCPSocket,
